@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <zephyr/drivers/flash.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/regulator.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/init.h>
 #include <string.h>
@@ -69,6 +70,8 @@ LOG_MODULE_REGISTER(spi_nor, CONFIG_FLASH_LOG_LEVEL);
 #define ANY_INST_HAS_RESET_GPIOS ANY_INST_HAS_PROP(reset_gpios)
 #define ANY_INST_HAS_WP_GPIOS ANY_INST_HAS_PROP(wp_gpios)
 #define ANY_INST_HAS_HOLD_GPIOS ANY_INST_HAS_PROP(hold_gpios)
+#define ANY_INST_HAS_SUPPLY_GPIOS ANY_INST_HAS_PROP(supply_gpios)
+#define ANY_INST_HAS_VIN_SUPPLY ANY_INST_HAS_PROP(vin_supply)
 
 #define DEV_CFG(_dev_) ((const struct spi_nor_config * const) (_dev_)->config)
 
@@ -134,6 +137,16 @@ struct spi_nor_config {
 	const struct gpio_dt_spec hold;
 #endif
 
+#if ANY_INST_HAS_SUPPLY_GPIOS
+	/* The supply GPIO (supply-gpios) */
+	const struct gpio_dt_spec supply;
+#endif
+
+#if ANY_INST_HAS_VIN_SUPPLY
+	/* The VIN supply regulator (vin-supply) */
+	const struct device *vin_supply;
+#endif
+
 #if ANY_INST_HAS_DPD
 	uint16_t t_enter_dpd; /* in microseconds */
 	uint16_t t_dpdd_ms;   /* in microseconds */
@@ -160,6 +173,8 @@ struct spi_nor_config {
 	bool requires_ulbpr_exist:1;
 	bool wp_gpios_exist:1;
 	bool hold_gpios_exist:1;
+	bool supply_gpios_exist:1;
+	bool vin_supply_exist:1;
 };
 
 /**
@@ -1508,6 +1523,30 @@ static int spi_nor_init(const struct device *dev)
 		}
 	}
 #endif /* ANY_INST_HAS_HOLD_GPIOS */
+#if ANY_INST_HAS_VIN_SUPPLY
+	if (DEV_CFG(dev)->vin_supply_exist) {
+		if (!device_is_ready(DEV_CFG(dev)->vin_supply)) {
+			LOG_ERR("VIN supply regulator not ready");
+			return -ENODEV;
+		}
+		if (regulator_enable(DEV_CFG(dev)->vin_supply)) {
+			LOG_ERR("Failed to enable VIN supply regulator");
+			return -ENODEV;
+		}
+	}
+#endif /* ANY_INST_VIN_SUPPLY */
+#if ANY_INST_HAS_SUPPLY_GPIOS
+	if (DEV_CFG(dev)->supply_gpios_exist) {
+		if (!device_is_ready(DEV_CFG(dev)->supply.port)) {
+			LOG_ERR("Supply pin not ready");
+			return -ENODEV;
+		}
+		if (gpio_pin_configure_dt(&(DEV_CFG(dev)->supply), GPIO_OUTPUT_ACTIVE)) {
+			LOG_ERR("Supply pin failed to set active");
+			return -ENODEV;
+		}
+	}
+#endif /* ANY_INST_SUPPLY_GPIOS */
 
 	return pm_device_driver_init(dev, spi_nor_pm_control);
 }
@@ -1602,6 +1641,10 @@ static const struct flash_driver_api spi_nor_api = {
 
 #define INST_HAS_HOLD_GPIO(idx) DT_INST_NODE_HAS_PROP(idx, hold_gpios)
 
+#define INST_HAS_SUPPLY_GPIO(idx) DT_INST_NODE_HAS_PROP(idx, supply_gpios)
+
+#define INST_HAS_VIN_SUPPLY(idx) DT_INST_NODE_HAS_PROP(idx, vin_supply)
+
 #define LOCK_DEFINE(idx)								\
 	IF_ENABLED(INST_HAS_LOCK(idx), (BUILD_ASSERT(DT_INST_PROP(idx, has_lock) ==	\
 					(DT_INST_PROP(idx, has_lock) & 0xFF),		\
@@ -1637,6 +1680,16 @@ static const struct flash_driver_api spi_nor_api = {
 		(.hold = GPIO_DT_SPEC_INST_GET(idx, hold_gpios)), \
 		(.hold = {0},))
 
+#define INIT_SUPPLY_GPIOS(idx) \
+	COND_CODE_1(DT_INST_NODE_HAS_PROP(idx, supply_gpios), \
+		(.supply = GPIO_DT_SPEC_INST_GET(idx, supply_gpios)), \
+		(.supply = {0},))
+
+#define INIT_VIN_SUPPLY(idx) \
+	COND_CODE_1(DT_INST_NODE_HAS_PROP(idx, supply_gpios), \
+		(.vin_supply = DEVICE_DT_GET(DT_INST_PROP(idx, vin_supply))), \
+		(.vin_supply = NULL,))
+
 #define INIT_WAKEUP_SEQ_PARAMS(idx)							\
 	COND_CODE_1(DT_INST_NODE_HAS_PROP(idx, dpd_wakeup_sequence),			\
 		(.t_dpdd_ms = DIV_ROUND_UP(						\
@@ -1669,6 +1722,8 @@ static const struct flash_driver_api spi_nor_api = {
 	.requires_ulbpr_exist =  DT_INST_PROP(idx, requires_ulbpr),				\
 	.wp_gpios_exist = DT_INST_NODE_HAS_PROP(idx, wp_gpios),					\
 	.hold_gpios_exist = DT_INST_NODE_HAS_PROP(idx, hold_gpios),				\
+	.supply_gpios_exist = DT_INST_NODE_HAS_PROP(idx, supply_gpios),				\
+	.vin_supply_exist = DT_INST_NODE_HAS_PROP(idx, vin_supply),				\
 	IF_ENABLED(INST_HAS_LOCK(idx), (.has_lock = DT_INST_PROP(idx, has_lock),))		\
 	IF_ENABLED(CONFIG_SPI_NOR_SFDP_MINIMAL, (CONFIGURE_4BYTE_ADDR(idx)))			\
 	IF_ENABLED(CONFIG_SPI_NOR_SFDP_DEVICETREE,						\
@@ -1680,7 +1735,9 @@ static const struct flash_driver_api spi_nor_api = {
 	IF_ENABLED(ANY_INST_HAS_MXICY_MX25R_POWER_MODE, (INIT_MXICY_MX25R_POWER_MODE(idx),))	\
 	IF_ENABLED(ANY_INST_HAS_RESET_GPIOS, (INIT_RESET_GPIOS(idx),))				\
 	IF_ENABLED(ANY_INST_HAS_WP_GPIOS, (INIT_WP_GPIOS(idx),))				\
-	IF_ENABLED(ANY_INST_HAS_HOLD_GPIOS, (INIT_HOLD_GPIOS(idx),))
+	IF_ENABLED(ANY_INST_HAS_HOLD_GPIOS, (INIT_HOLD_GPIOS(idx),))				\
+	IF_ENABLED(ANY_INST_HAS_SUPPLY_GPIOS, (INIT_SUPPLY_GPIOS(idx),))			\
+	IF_ENABLED(ANY_INST_HAS_VIN_SUPPLY, (INIT_VIN_SUPPLY(idx),))
 
 #define GENERATE_CONFIG_STRUCT(idx)								\
 	static const struct spi_nor_config spi_nor_##idx##_config = {				\
